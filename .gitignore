@@ -1,0 +1,7 @@
+libs/
+bin/
+obj/
+*.user
+*.suo
+*.cache
+*.tmp
