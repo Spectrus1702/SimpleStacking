@@ -1,4 +1,4 @@
-# SimpleInventoryStacking
+# SimpleStacking
 
 A Planet Crafter mod that adds item stacking for plater inventory, chests and some extractors.
 
