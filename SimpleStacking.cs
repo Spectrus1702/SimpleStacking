@@ -13,13 +13,13 @@ using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.UI;
 
-namespace SimpleInventoryStacking;
+namespace SimpleStacking;
 
 [BepInPlugin(PluginGuid, PluginName, PluginVersion)]
 public sealed class Plugin : BaseUnityPlugin
 {
-    public const string PluginGuid = "local.theplanetcrafter.simpleinventorystacking";
-    public const string PluginName = "Simple Inventory Stacking";
+    public const string PluginGuid = "local.theplanetcrafter.simplestacking";
+    public const string PluginName = "Simple Stacking";
     public const string PluginVersion = "1.0.3";
 
     private static readonly Dictionary<string, int> GroupCounts = new();
@@ -57,9 +57,9 @@ public sealed class Plugin : BaseUnityPlugin
         Log = Logger;
         
         StackSize = Config.Bind("General", "StackSize", 10, "How many equal items fit into one visible slot.");
-        FontSize = Config.Bind("General", "FontSize", 25, "Stack counter font size.");
-        OffsetX = Config.Bind("General", "OffsetX", 0f, "Move stack counter horizontally.");
-        OffsetY = Config.Bind("General", "OffsetY", 0f, "Move stack counter vertically.");
+        FontSize = Config.Bind("General", "FontSize", 15, "Stack counter font size.");
+        OffsetX = Config.Bind("General", "OffsetX", -2f, "Move stack counter horizontally.");
+        OffsetY = Config.Bind("General", "OffsetY", 2f, "Move stack counter vertically.");
 		AlignLeft = Config.Bind("General", "AlignLeft", false, "Align stack counter to the left instead of the right.");
         StackBackpack = Config.Bind("General", "StackBackpack", true, "Allow stacking in the player backpack.");
         StackOpenedContainers = Config.Bind("General", "StackOpenedContainers", true, "Allow stacking in opened storage/container inventories.");
