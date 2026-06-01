@@ -1,8 +1,8 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
-using System.Reflection;
 using System.Text;
 using BepInEx;
 using BepInEx.Configuration;
@@ -11,6 +11,7 @@ using HarmonyLib;
 using SpaceCraft;
 using UnityEngine;
 using UnityEngine.EventSystems;
+using UnityEngine.InputSystem;
 using UnityEngine.UI;
 
 namespace SimpleStacking;
@@ -18,13 +19,11 @@ namespace SimpleStacking;
 [BepInPlugin(PluginGuid, PluginName, PluginVersion)]
 public sealed class Plugin : BaseUnityPlugin
 {
-    public const string PluginGuid = "local.theplanetcrafter.simplestacking";
+    public const string PluginGuid = "local.theplanetcrafter.simplesting.v2";
     public const string PluginName = "Simple Stacking";
-    public const string PluginVersion = "1.0.3";
+    public const string PluginVersion = "1.1.1";
 
-    private static readonly Dictionary<string, int> GroupCounts = new();
     private static readonly HashSet<int> AllowedContainerInventories = new();
-    private static readonly HashSet<int> BlockedInventories = new();
     private static readonly string[] DefaultStorageNeedles = { "container", "storage", "locker", "chest" };
 
     private static ManualLogSource Log;
@@ -36,51 +35,55 @@ public sealed class Plugin : BaseUnityPlugin
     private static ConfigEntry<bool> StackOpenedContainers;
     private static ConfigEntry<string> StorageGroupIdContains;
     private static ConfigEntry<bool> DebugMode;
-	private static ConfigEntry<bool> AlignLeft;
-	private static ConfigEntry<float> CounterWidth;
-	
+    private static ConfigEntry<bool> AlignLeft;
+    private static ConfigEntry<float> CounterWidth;
+    
     private static ConfigEntry<bool> StackOreExtractors;
     private static ConfigEntry<bool> StackWaterCollectors;
     private static ConfigEntry<bool> StackGasExtractors;
 
-    private static MethodInfo onImageClicked;
-    private static MethodInfo onDropClicked;
-    private static MethodInfo onActionViaGamepad;
-    private static MethodInfo onConsumeViaGamepad;
-    private static MethodInfo onDropViaGamepad;
-    private static MethodInfo addItemInInventory;
+    private static Plugin Instance;
+    private static bool shiftTransferInProgress;
     private static Font font;
-	
+    
+    // Рефлексия для доступа к protected методам
+    private static System.Reflection.MethodInfo onImageClickedMethod;
+    private static System.Reflection.MethodInfo onDropClickedMethod;
+    private static System.Reflection.MethodInfo onActionViaGamepadMethod;
+    private static System.Reflection.MethodInfo onConsumeViaGamepadMethod;
+    private static System.Reflection.MethodInfo onDropViaGamepadMethod;
 
     private void Awake()
     {
+        Instance = this;
         Log = Logger;
         
         StackSize = Config.Bind("General", "StackSize", 10, "How many equal items fit into one visible slot.");
         FontSize = Config.Bind("General", "FontSize", 15, "Stack counter font size.");
         OffsetX = Config.Bind("General", "OffsetX", -2f, "Move stack counter horizontally.");
         OffsetY = Config.Bind("General", "OffsetY", 2f, "Move stack counter vertically.");
-		AlignLeft = Config.Bind("General", "AlignLeft", false, "Align stack counter to the left instead of the right.");
+        AlignLeft = Config.Bind("General", "AlignLeft", false, "Align stack counter to the left instead of the right.");
         StackBackpack = Config.Bind("General", "StackBackpack", true, "Allow stacking in the player backpack.");
         StackOpenedContainers = Config.Bind("General", "StackOpenedContainers", true, "Allow stacking in opened storage/container inventories.");
         StorageGroupIdContains = Config.Bind("General", "StorageGroupIdContains", "container,storage,locker,chest", "Comma-separated owner group-id fragments treated as storage.");
         DebugMode = Config.Bind("General", "DebugMode", false, "Write detailed diagnostic logs.");
-		CounterWidth = Config.Bind("General", "CounterWidth", 40f, "Width of stack counter area.");
-		
+        CounterWidth = Config.Bind("General", "CounterWidth", 40f, "Width of stack counter area.");
+        
         StackOreExtractors = Config.Bind("Machines", "StackOreExtractors", true, "Allow stacking in Ore Extractors (OreExtractor1, OreExtractor2, OreExtractor3).");
         StackWaterCollectors = Config.Bind("Machines", "StackWaterCollectors", true, "Allow stacking in Water Collectors (WaterCollector1, WaterCollector2).");
         StackGasExtractors = Config.Bind("Machines", "StackGasExtractors", true, "Allow stacking in Gas Extractors (GasExtractor1, GasExtractor2).");
 
-        onImageClicked = AccessTools.Method(typeof(InventoryDisplayer), "OnImageClicked");
-        onDropClicked = AccessTools.Method(typeof(InventoryDisplayer), "OnDropClicked");
-        onActionViaGamepad = AccessTools.Method(typeof(InventoryDisplayer), "OnActionViaGamepad");
-        onConsumeViaGamepad = AccessTools.Method(typeof(InventoryDisplayer), "OnConsumeViaGamepad");
-        onDropViaGamepad = AccessTools.Method(typeof(InventoryDisplayer), "OnDropViaGamepad");
-        addItemInInventory = AccessTools.Method(typeof(Inventory), "AddItemInInventory");
         font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+        
+        // Получаем методы через рефлексию (они protected)
+        onImageClickedMethod = AccessTools.Method(typeof(InventoryDisplayer), "OnImageClicked");
+        onDropClickedMethod = AccessTools.Method(typeof(InventoryDisplayer), "OnDropClicked");
+        onActionViaGamepadMethod = AccessTools.Method(typeof(InventoryDisplayer), "OnActionViaGamepad");
+        onConsumeViaGamepadMethod = AccessTools.Method(typeof(InventoryDisplayer), "OnConsumeViaGamepad");
+        onDropViaGamepadMethod = AccessTools.Method(typeof(InventoryDisplayer), "OnDropViaGamepad");
 
         Harmony.CreateAndPatchAll(typeof(Plugin), PluginGuid);
-        Logger.LogInfo($"{PluginName} {PluginVersion} loaded.");
+        Logger.LogInfo($"{PluginName} {PluginVersion} loaded for Planet Crafter v2.008");
         Logger.LogInfo($"Stacking enabled for: Ore Extractors={StackOreExtractors.Value}, Water Collectors={StackWaterCollectors.Value}, Gas Extractors={StackGasExtractors.Value}");
     }
 
@@ -94,7 +97,7 @@ public sealed class Plugin : BaseUnityPlugin
 
     private static bool CanStack(Inventory inventory)
     {
-        if (inventory == null || StackSize.Value <= 1 || BlockedInventories.Contains(inventory.GetId()))
+        if (inventory == null || StackSize.Value <= 1)
         {
             return false;
         }
@@ -118,19 +121,11 @@ public sealed class Plugin : BaseUnityPlugin
         string groupId = owner.GetGroup()?.GetId() ?? "";
         
         if (groupId.StartsWith("OreExtractor"))
-        {
             return StackOreExtractors.Value;
-        }
-        
         if (groupId.StartsWith("WaterCollector"))
-        {
             return StackWaterCollectors.Value;
-        }
-        
         if (groupId.StartsWith("GasExtractor"))
-        {
             return StackGasExtractors.Value;
-        }
 
         return true;
     }
@@ -138,43 +133,29 @@ public sealed class Plugin : BaseUnityPlugin
     private static WorldObject GetInventoryOwner(Inventory inventory)
     {
         if (inventory == null) return null;
-        
         return WorldObjectsHandler.Instance?.GetWorldObjectForInventory(inventory);
     }
 
     private static bool IsPlayerBackpack(Inventory inventory)
     {
-        if (!StackBackpack.Value)
-        {
-            return false;
-        }
+        if (!StackBackpack.Value) return false;
 
         try
         {
             PlayersManager players = Managers.GetManager<PlayersManager>();
-            if (players == null)
-            {
-                return false;
-            }
+            if (players == null) return false;
 
             PlayerMainController active = players.GetActivePlayerController();
             if (active?.GetPlayerBackpack()?.GetInventory() == inventory)
-            {
                 return true;
-            }
 
             foreach (PlayerMainController player in players.playersControllers)
             {
                 if (player?.GetPlayerBackpack()?.GetInventory() == inventory)
-                {
                     return true;
-                }
             }
         }
-        catch
-        {
-            return false;
-        }
+        catch { return false; }
 
         return false;
     }
@@ -182,13 +163,10 @@ public sealed class Plugin : BaseUnityPlugin
     private static bool LooksLikeStorage(WorldObject owner)
     {
         string id = owner?.GetGroup()?.GetId();
-        if (string.IsNullOrEmpty(id))
-        {
-            return false;
-        }
+        if (string.IsNullOrEmpty(id)) return false;
 
         string lower = id.ToLowerInvariant();
-        IEnumerable<string> needles = StorageGroupIdContains.Value
+        var needles = StorageGroupIdContains.Value
             .Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
             .Select(s => s.Trim().ToLowerInvariant())
             .Where(s => s.Length != 0);
@@ -199,10 +177,7 @@ public sealed class Plugin : BaseUnityPlugin
 
     private static void AllowContainerInventory(Inventory inventory, WorldObject owner, string source)
     {
-        if (!StackOpenedContainers.Value || inventory == null)
-        {
-            return;
-        }
+        if (!StackOpenedContainers.Value || inventory == null) return;
 
         if (LooksLikeStorage(owner))
         {
@@ -214,6 +189,7 @@ public sealed class Plugin : BaseUnityPlugin
     private static string GetStackId(WorldObject worldObject)
     {
         string id = worldObject.GetGroup().GetId();
+        
         if (id == "GeneticTrait")
         {
             StringBuilder builder = new(48);
@@ -237,7 +213,6 @@ public sealed class Plugin : BaseUnityPlugin
                     AppendTraitInfo(trait.GetGeneticTraitType(), trait.GetGeneticTraitValue(), trait.GetColor(), builder);
                 }
             }
-
             return builder.ToString();
         }
 
@@ -273,10 +248,7 @@ public sealed class Plugin : BaseUnityPlugin
 
         foreach (WorldObject worldObject in worldObjects)
         {
-            if (worldObject == null)
-            {
-                continue;
-            }
+            if (worldObject == null) continue;
 
             string stackId = GetStackId(worldObject);
             if (!openStacks.TryGetValue(stackId, out List<WorldObject> stack))
@@ -297,59 +269,237 @@ public sealed class Plugin : BaseUnityPlugin
         return slots;
     }
 
-    private static int GetStackCount(IEnumerable<WorldObject> items)
+    private static bool IsShiftPressed()
+    {
+        Keyboard keyboard = Keyboard.current;
+        return keyboard != null && (keyboard.leftShiftKey.isPressed || keyboard.rightShiftKey.isPressed);
+    }
+
+    private static int GetPartialStackSpace(Inventory inventory, string stackId, int stackSize)
+    {
+        int space = 0;
+        foreach (List<WorldObject> slot in CreateInventorySlots(inventory.GetInsideWorldObjects()))
+        {
+            if (slot.Count > 0 && slot.Count < stackSize && GetStackId(slot[0]) == stackId)
+            {
+                space += stackSize - slot.Count;
+            }
+        }
+
+        return space;
+    }
+
+    private static bool HasFreeVisibleSlot(Inventory inventory)
+    {
+        return CreateInventorySlots(inventory.GetInsideWorldObjects()).Count < inventory.GetSize();
+    }
+
+    private static Inventory GetOtherOpenInventory(Inventory from, InventoryDisplayer displayer)
+    {
+        if (from == null)
+        {
+            return null;
+        }
+
+        try
+        {
+            WindowsHandler windowsHandler = Managers.GetManager<WindowsHandler>();
+            UiWindowContainer container = windowsHandler?.GetWindowViaUiId(windowsHandler.GetOpenedUi()) as UiWindowContainer;
+            Inventory other = container?.GetOtherInventory(from);
+            if (other != null && other != from)
+            {
+                return other;
+            }
+        }
+        catch (Exception ex)
+        {
+            DebugLog("Unable to resolve other inventory from opened container: " + ex.Message);
+        }
+
+        Inventory fallback = (Inventory)AccessTools.Field(typeof(InventoryDisplayer), "_inventoryInteracting").GetValue(displayer);
+        return fallback != from ? fallback : null;
+    }
+
+    private static List<WorldObject> FindSlotForStackTransfer(Inventory from, WorldObject clickedItem, string stackId, bool preferFullStack)
     {
         int stackSize = Math.Max(1, StackSize.Value);
-        int stacks = 0;
-        GroupCounts.Clear();
+        List<WorldObject> clickedSlot = null;
+        List<WorldObject> fullSlot = null;
 
-        foreach (WorldObject item in items)
+        foreach (List<WorldObject> slot in CreateInventorySlots(from.GetInsideWorldObjects()))
         {
-            if (item == null)
+            if (slot.Count == 0 || GetStackId(slot[0]) != stackId)
             {
                 continue;
             }
 
-            AddToStackCount(GetStackId(item), stackSize, ref stacks);
-        }
-
-        return stacks;
-    }
-
-    private static bool WouldBeFull(IEnumerable<WorldObject> items, int inventorySize, string incomingStackId)
-    {
-        int stackSize = Math.Max(1, StackSize.Value);
-        int stacks = 0;
-        GroupCounts.Clear();
-
-        foreach (WorldObject item in items)
-        {
-            if (item != null)
+            if (slot.Contains(clickedItem))
             {
-                AddToStackCount(GetStackId(item), stackSize, ref stacks);
+                clickedSlot = slot;
+            }
+
+            if (fullSlot == null && slot.Count >= stackSize)
+            {
+                fullSlot = slot;
             }
         }
 
-        if (!string.IsNullOrEmpty(incomingStackId))
+        if (preferFullStack && clickedSlot != null && clickedSlot.Count < stackSize && fullSlot != null)
         {
-            AddToStackCount(incomingStackId, stackSize, ref stacks);
+            return fullSlot;
         }
 
-        return stacks > inventorySize;
+        return clickedSlot ?? fullSlot;
     }
 
-    private static void AddToStackCount(string stackId, int stackSize, ref int stacks)
+    private static bool TryTransferStackOnShiftClick(InventoryDisplayer displayer, EventTriggerCallbackData eventData)
     {
-        GroupCounts.TryGetValue(stackId, out int count);
-        count++;
-        if (count == 1 || count > stackSize)
+        if (Instance == null || displayer == null || eventData?.worldObject == null)
         {
-            stacks++;
-            count = 1;
+            return false;
         }
 
-        GroupCounts[stackId] = count;
+        if (eventData.pointerEventData != null && eventData.pointerEventData.button != PointerEventData.InputButton.Left)
+        {
+            return false;
+        }
+
+        Inventory from = (Inventory)AccessTools.Field(typeof(InventoryDisplayer), "_inventory").GetValue(displayer);
+        Inventory to = GetOtherOpenInventory(from, displayer);
+        if (!CanStack(from) || !CanStack(to))
+        {
+            return false;
+        }
+
+        if (shiftTransferInProgress)
+        {
+            DebugLog("Shift stack transfer skipped: another transfer is still running");
+            return true;
+        }
+
+        int stackSize = Math.Max(1, StackSize.Value);
+        string stackId = GetStackId(eventData.worldObject);
+        bool targetHasFreeSlot = HasFreeVisibleSlot(to);
+        int partialSpace = GetPartialStackSpace(to, stackId, stackSize);
+        int targetCapacityForClick = targetHasFreeSlot ? stackSize : partialSpace;
+        if (targetCapacityForClick <= 0)
+        {
+            DebugLog($"Shift stack transfer skipped: target inventory {to.GetId()} has no room for {stackId}");
+            return true;
+        }
+
+        List<WorldObject> sourceSlot = FindSlotForStackTransfer(from, eventData.worldObject, stackId, targetHasFreeSlot);
+        if (sourceSlot == null || sourceSlot.Count == 0)
+        {
+            return true;
+        }
+
+        int amount = Math.Min(sourceSlot.Count, targetCapacityForClick);
+        if (amount <= 0)
+        {
+            return true;
+        }
+
+        List<WorldObject> itemsToTransfer = sourceSlot.Take(amount).ToList();
+        DebugLog($"Shift stack transfer: {amount}x {stackId} from {from.GetId()} to {to.GetId()}");
+        Instance.StartCoroutine(TransferItems(from, to, itemsToTransfer, stackId));
+        return true;
     }
+
+    private static bool CanReceiveStackItem(Inventory inventory, string stackId, int stackSize)
+    {
+        return HasFreeVisibleSlot(inventory) || GetPartialStackSpace(inventory, stackId, stackSize) > 0;
+    }
+
+    private static IEnumerator TransferItems(Inventory from, Inventory to, List<WorldObject> items, string stackId)
+    {
+        shiftTransferInProgress = true;
+        int stackSize = Math.Max(1, StackSize.Value);
+
+        try
+        {
+            foreach (WorldObject item in items)
+            {
+                if (item == null || !from.ContainWorldObject(item) || !CanReceiveStackItem(to, stackId, stackSize))
+                {
+                    continue;
+                }
+
+                bool removed = from.RemoveItem(item);
+                if (!removed)
+                {
+                    DebugLog($"Shift stack transfer stopped: source did not contain {GetStackId(item)}");
+                    break;
+                }
+
+                bool added = to.AddItem(item, false);
+                if (!added)
+                {
+                    DebugLog($"Shift stack transfer stopped: target rejected {GetStackId(item)}, returning item to source");
+                    from.AddItem(item, false);
+                    break;
+                }
+
+                yield return null;
+            }
+        }
+        finally
+        {
+            shiftTransferInProgress = false;
+            from.RefreshDisplayerContent();
+            to.RefreshDisplayerContent();
+        }
+    }
+
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(InventoryDisplayer), "OnImageClicked")]
+    private static bool InventoryDisplayer_OnImageClicked_Pre(InventoryDisplayer __instance, EventTriggerCallbackData eventTriggerCallbackData)
+    {
+        try
+        {
+            if (!IsShiftPressed())
+            {
+                return true;
+            }
+
+            return !TryTransferStackOnShiftClick(__instance, eventTriggerCallbackData);
+        }
+        catch (Exception ex)
+        {
+            Log.LogWarning("Shift stack transfer failed before vanilla click: " + ex);
+            return true;
+        }
+    }
+
+	private static int GetStackCount(ReadOnlyCollection<WorldObject> items)
+	{
+		int stackSize = Math.Max(1, StackSize.Value);
+		Dictionary<string, int> stackCounts = new Dictionary<string, int>();
+		int occupiedSlots = 0;
+		
+		foreach (WorldObject item in items)
+		{
+			if (item == null) continue;
+			
+			string stackId = GetStackId(item);
+			
+			if (!stackCounts.ContainsKey(stackId))
+			{
+				stackCounts[stackId] = 0;
+				occupiedSlots++;
+			}
+			stackCounts[stackId]++;
+			
+			// Если стак переполнен, увеличиваем количество слотов
+			if (stackCounts[stackId] > stackSize)
+			{
+				occupiedSlots++;
+				stackCounts[stackId] -= stackSize;
+			}
+		}
+		
+		return occupiedSlots;
+	}
 
     private static void AddStackDisplay(GameObject slot, int amount)
     {
@@ -360,9 +510,7 @@ public sealed class Plugin : BaseUnityPlugin
         text.font = font;
         text.fontSize = FontSize.Value;
         text.fontStyle = FontStyle.Bold;
-        text.alignment = AlignLeft.Value
-			? TextAnchor.LowerLeft
-			: TextAnchor.LowerRight;
+        text.alignment = AlignLeft.Value ? TextAnchor.LowerLeft : TextAnchor.LowerRight;
         text.raycastTarget = false;
         text.color = Color.white;
         text.text = amount.ToString();
@@ -372,13 +520,14 @@ public sealed class Plugin : BaseUnityPlugin
         shadow.effectDistance = new Vector2(1.5f, -1.5f);
 
         RectTransform rect = counter.GetComponent<RectTransform>();
-		rect.anchorMin = new Vector2(1f, 0f);
-		rect.anchorMax = new Vector2(1f, 0f);
-		rect.pivot = new Vector2(1f, 0f);
-		rect.sizeDelta = new Vector2(CounterWidth.Value, 30f);
-		rect.anchoredPosition = new Vector2(-4f + OffsetX.Value, 2f + OffsetY.Value);
+        rect.anchorMin = new Vector2(1f, 0f);
+        rect.anchorMax = new Vector2(1f, 0f);
+        rect.pivot = new Vector2(1f, 0f);
+        rect.sizeDelta = new Vector2(CounterWidth.Value, 30f);
+        rect.anchoredPosition = new Vector2(-4f + OffsetX.Value, 2f + OffsetY.Value);
     }
 
+    // Патчи для контейнеров
     [HarmonyPrefix]
     [HarmonyPatch(typeof(ActionOpenable), "OpenInventories")]
     private static void ActionOpenable_OpenInventories_Pre(ActionOpenable __instance, Inventory objectInventory, WorldObject worldObject)
@@ -409,81 +558,118 @@ public sealed class Plugin : BaseUnityPlugin
     private static void InventoriesHandler_DestroyInventory_Post(int inventoryId)
     {
         AllowedContainerInventories.Remove(inventoryId);
-        BlockedInventories.Remove(inventoryId);
     }
 
-    [HarmonyPostfix]
-    [HarmonyPatch(typeof(InventoryAssociated), "SetInventory")]
-    private static void InventoryAssociated_SetInventory_Post(InventoryAssociated __instance, Inventory inventory)
-    {
-        if (inventory == null) return;
-        
-        WorldObject owner = WorldObjectsHandler.Instance?.GetWorldObjectForInventory(inventory);
-        if (owner != null && !LooksLikeStorage(owner))
-        {
-            DebugLog($"InventoryAssociated: inventory {inventory.GetId()} assigned to {owner.GetGroup()?.GetId() ?? "unknown"}");
-        }
-    }
-
+    // Патч для IsFull - учитывает стаки
     [HarmonyPrefix]
     [HarmonyPatch(typeof(Inventory), "IsFull")]
     private static bool Inventory_IsFull_Pre(Inventory __instance, ref bool __result)
     {
-        if (!CanStack(__instance))
-        {
-            return true;
-        }
+        if (!CanStack(__instance)) return true;
 
         __result = GetStackCount(__instance.GetInsideWorldObjects()) >= __instance.GetSize();
         return false;
     }
 
-    [HarmonyPrefix]
-    [HarmonyPatch(typeof(Inventory), "AddItem")]
-    private static bool Inventory_AddItem_Pre(Inventory __instance, WorldObject worldObject, ref bool __result)
-    {
-        if (!CanStack(__instance) || worldObject == null)
-        {
-            return true;
-        }
+    // Патч для AddItemInInventory - корректное добавление с учётом стаков
+	[HarmonyPrefix]
+	[HarmonyPatch(typeof(Inventory), "AddItemInInventory")]
+	private static bool Inventory_AddItemInInventory_Pre(
+		Inventory __instance, 
+		WorldObject worldObject, 
+		bool resetPositionAndRotation, 
+		ref bool __result)
+	{
+		if (!CanStack(__instance) || worldObject == null)
+		{
+			return true;
+		}
 
-        if (WouldBeFull(__instance.GetInsideWorldObjects(), __instance.GetSize(), GetStackId(worldObject)))
-        {
-            __result = false;
-            return false;
-        }
+		int stackSize = Math.Max(1, StackSize.Value);
+		string newStackId = GetStackId(worldObject);
+		
+		// Получаем текущее состояние
+		var worldObjectsList = (List<WorldObject>)AccessTools.Field(typeof(Inventory), "_worldObjectsInInventory").GetValue(__instance);
+		
+		// Считаем текущие стаки
+		Dictionary<string, int> stackCounts = new Dictionary<string, int>();
+		int usedSlots = 0;
+		
+		foreach (WorldObject item in worldObjectsList)
+		{
+			if (item == null) continue;
+			string stackId = GetStackId(item);
+			
+			if (!stackCounts.ContainsKey(stackId))
+			{
+				stackCounts[stackId] = 0;
+				usedSlots++;
+			}
+			stackCounts[stackId]++;
+			
+			// Если переполнение - учитываем дополнительные слоты
+			if (stackCounts[stackId] > stackSize)
+			{
+				usedSlots++;
+				stackCounts[stackId] -= stackSize;
+			}
+		}
+		
+		// Проверяем, можно ли добавить
+		bool canAdd = false;
+		
+		if (stackCounts.ContainsKey(newStackId))
+		{
+			// Есть такой тип - проверяем текущий размер стака
+			int currentCount = 0;
+			// Нужно посчитать актуальное количество предметов этого типа
+			foreach (WorldObject item in worldObjectsList)
+			{
+				if (item != null && GetStackId(item) == newStackId)
+					currentCount++;
+			}
+			
+			// Если текущий стак не полный (по остатку от деления на stackSize)
+			if (currentCount % stackSize != 0)
+			{
+				canAdd = true;
+			}
+		}
+		
+		// Если нет такого типа или не можем добавить в существующий - проверяем свободные слоты
+		if (!canAdd)
+		{
+			// Свободные слоты = общий размер - использованные слоты
+			int freeSlots = __instance.GetSize() - usedSlots;
+			if (freeSlots > 0)
+			{
+				canAdd = true;
+			}
+		}
+		
+		if (!canAdd)
+		{
+			__result = false;
+			return false;
+		}
+		
+		// Добавляем предмет
+		if (!worldObjectsList.Contains(worldObject))
+		{
+			worldObjectsList.Add(worldObject);
+		}
+		
+		if (resetPositionAndRotation)
+		{
+			worldObject.ResetPositionAndRotation();
+		}
+		worldObject.SetLockInInventoryTime(0f);
+		
+		__result = true;
+		return false;
+	}
 
-        __result = (bool)addItemInInventory.Invoke(__instance, new object[] { worldObject });
-        return false;
-    }
-
-    [HarmonyPrefix]
-    [HarmonyPatch(typeof(Inventory), "DropObjectsIfNotEnoughSpace")]
-    private static bool Inventory_DropObjectsIfNotEnoughSpace_Pre(Inventory __instance, Vector3 dropPosition, bool removeOnly, ref List<WorldObject> __result)
-    {
-        if (!CanStack(__instance))
-        {
-            return true;
-        }
-
-        List<WorldObject> dropped = new();
-        List<WorldObject> content = __instance.GetInsideWorldObjects().ToList();
-        while (GetStackCount(content) > __instance.GetSize() && content.Count > 0)
-        {
-            WorldObject worldObject = content[content.Count - 1];
-            dropped.Add(worldObject);
-            __instance.RemoveItem(worldObject);
-            content.RemoveAt(content.Count - 1);
-            if (!removeOnly)
-            {
-                WorldObjectsHandler.Instance.DropOnFloor(worldObject, dropPosition, 0f, true, false, 0);
-            }
-        }
-
-        __result = dropped;
-        return false;
-    }
-
+    // Основной патч для отображения инвентаря со стаками
     [HarmonyPrefix]
     [HarmonyPatch(typeof(InventoryDisplayer), "SetInventoryBlocks")]
     private static bool InventoryDisplayer_SetInventoryBlocks_Pre(
@@ -494,35 +680,39 @@ public sealed class Plugin : BaseUnityPlugin
         bool enabled)
     {
         Inventory inventory = (Inventory)AccessTools.Field(typeof(InventoryDisplayer), "_inventory").GetValue(__instance);
+        
         if (!CanStack(inventory))
         {
             return true;
         }
 
         GridLayoutGroup grid = (GridLayoutGroup)AccessTools.Field(typeof(InventoryDisplayer), "_grid").GetValue(__instance);
-        VisualsResourcesHandler visuals = (VisualsResourcesHandler)AccessTools.Field(typeof(InventoryDisplayer), "_visualResourcesHandler").GetValue(__instance);
-        LogisticManager logisticManager = (LogisticManager)AccessTools.Field(typeof(InventoryDisplayer), "_logisticManager").GetValue(__instance);
-        WindowsGamepadHandler gamepadHandler = (WindowsGamepadHandler)AccessTools.Field(typeof(InventoryDisplayer), "_windowsHandlerControllers").GetValue(__instance);
-        int selectionIndex = (int)AccessTools.Field(typeof(InventoryDisplayer), "_selectionIndex").GetValue(__instance);
+        VisualsResourcesHandler visuals = Managers.GetManager<VisualsResourcesHandler>();
+        LogisticManager logisticManager = Managers.GetManager<LogisticManager>();
+        WindowsGamepadHandler gamepadHandler = Managers.GetManager<WindowsGamepadHandler>();
 
         GameObjects.DestroyAllChildren(grid.gameObject, false);
         GameObject inventoryBlock = visuals.GetInventoryBlock();
         bool isPlayerInventory = IsPlayerBackpack(inventory);
         HashSet<Group> authorizedGroups = inventory.GetAuthorizedGroups();
-        Sprite authorizedIcon = authorizedGroups.Count > 0 ? visuals.GetGroupItemCategoriesSprite(authorizedGroups.First()) : null;
+        Sprite authorizedGroupIcon = authorizedGroups.Count > 0 ? visuals.GetGroupItemCategoriesSprite(authorizedGroups.First()) : null;
+        
         List<List<WorldObject>> slots = CreateInventorySlots(inventoryWorldObjects);
 
         for (int i = 0; i < inventory.GetSize(); i++)
         {
             GameObject slot = UnityEngine.Object.Instantiate(inventoryBlock, grid.transform);
             InventoryBlock block = slot.GetComponent<InventoryBlock>();
-            block.SetAuthorizedGroupIcon(authorizedIcon);
+            block.SetAuthorizedGroupIcon(authorizedGroupIcon);
 
             if (i < slots.Count && slots[i].Count > 0)
             {
                 List<WorldObject> stack = slots[i];
                 WorldObject item = stack[stack.Count - 1];
-                bool showDropIcon = isPlayerInventory && (!(item.GetGroup() is GroupItem groupItem) || !groupItem.GetCantBeDestroyed());
+                
+                bool showDropIcon = isPlayerInventory && 
+                    (!(item.GetGroup() is GroupItem groupItem) || !groupItem.GetCantBeDestroyed());
+                
                 block.SetDisplay(item, infosDisplayerBlockSwitches, showDropIcon);
 
                 if (stack.Count > 1)
@@ -532,16 +722,22 @@ public sealed class Plugin : BaseUnityPlugin
 
                 if (!item.GetIsLockedInInventory())
                 {
-                    EventsHelpers.AddTriggerEvent(slot, EventTriggerType.PointerClick, data => onImageClicked.Invoke(__instance, new object[] { data }), null, item, 0);
-                    EventsHelpers.AddTriggerEvent(block.GetDropIcon(), EventTriggerType.PointerClick, data => onDropClicked.Invoke(__instance, new object[] { data }), null, item, 0);
-                    slot.AddComponent<EventGamepadAction>().SetEventGamepadAction(
-                        (Action<WorldObject, Group, int>)Delegate.CreateDelegate(typeof(Action<WorldObject, Group, int>), __instance, onActionViaGamepad),
-                        item.GetGroup(),
-                        item,
-                        i,
-                        (Action<WorldObject, Group, int>)Delegate.CreateDelegate(typeof(Action<WorldObject, Group, int>), __instance, onConsumeViaGamepad),
-                        isPlayerInventory ? (Action<WorldObject, Group, int>)Delegate.CreateDelegate(typeof(Action<WorldObject, Group, int>), __instance, onDropViaGamepad) : null,
-                        null);
+                    EventTriggerCallbackData eventData = new EventTriggerCallbackData(item);
+                    eventData.intValue = i;
+                    
+                    EventsHelpers.AddTriggerEvent(slot, EventTriggerType.PointerClick, 
+                        (Action<EventTriggerCallbackData>)Delegate.CreateDelegate(typeof(Action<EventTriggerCallbackData>), __instance, onImageClickedMethod), 
+                        eventData);
+                    
+                    EventsHelpers.AddTriggerEvent(block.GetDropIcon(), EventTriggerType.PointerClick, 
+                        (Action<EventTriggerCallbackData>)Delegate.CreateDelegate(typeof(Action<EventTriggerCallbackData>), __instance, onDropClickedMethod), 
+                        eventData);
+                    
+                    var actionDelegate = (Action<EventTriggerCallbackData>)Delegate.CreateDelegate(typeof(Action<EventTriggerCallbackData>), __instance, onActionViaGamepadMethod);
+                    var consumeDelegate = (Action<EventTriggerCallbackData>)Delegate.CreateDelegate(typeof(Action<EventTriggerCallbackData>), __instance, onConsumeViaGamepadMethod);
+                    var dropDelegate = showDropIcon ? (Action<EventTriggerCallbackData>)Delegate.CreateDelegate(typeof(Action<EventTriggerCallbackData>), __instance, onDropViaGamepadMethod) : null;
+                    
+                    slot.AddComponent<EventGamepadAction>().SetEventGamepadAction(actionDelegate, eventData, consumeDelegate, dropDelegate, null);
                 }
 
                 if (shouldCheckItemsLogisticsStatus)
@@ -549,116 +745,21 @@ public sealed class Plugin : BaseUnityPlugin
                     block.SetLogisticStatus(logisticManager.WorldObjectIsInTasks(item));
                 }
             }
+            else
+            {
+                slot.AddComponent<EventGamepadAction>().SetEventGamepadAction(null, new EventTriggerCallbackData(i), null, null, null);
+            }
 
             slot.SetActive(true);
-            if (enabled && i == selectionIndex)
+            
+            if (!enabled)
             {
-                gamepadHandler.SelectForController(slot, true, false, true, true, true);
-            }
-            else if (!enabled)
-            {
-                Selectable selectable = slot.GetComponentInChildren<Selectable>();
+                var selectable = slot.GetComponentInChildren<Selectable>();
                 if (selectable != null)
-                {
                     selectable.interactable = false;
-                }
             }
         }
 
-        return false;
-    }
-
-    [HarmonyPrefix]
-    [HarmonyPatch(typeof(JsonablesHelper), "JsonableToInventory")]
-    private static bool JsonablesHelper_JsonableToInventory_Pre(JsonableInventory __0, Dictionary<int, WorldObject> __1, ref Inventory __result)
-    {
-        if (StackSize.Value <= 1)
-        {
-            return true;
-        }
-
-        JsonableInventory jsonableInventory = __0;
-        Dictionary<int, WorldObject> objectMap = __1;
-        List<WorldObject> list = new();
-        string ids = jsonableInventory.woIds ?? "";
-        foreach (string idText in ids.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
-        {
-            if (int.TryParse(idText, out int id) && objectMap.TryGetValue(id, out WorldObject worldObject))
-            {
-                list.Add(worldObject);
-            }
-        }
-
-        __result = new Inventory(
-            jsonableInventory.id,
-            jsonableInventory.size,
-            list,
-            GroupsHandler.GetGroupsViaString(jsonableInventory.supplyGrps, new HashSet<Group>()) as HashSet<Group>,
-            GroupsHandler.GetGroupsViaString(jsonableInventory.demandGrps, new HashSet<Group>()) as HashSet<Group>,
-            jsonableInventory.priority);
-        return false;
-    }
-
-    [HarmonyPrefix]
-    [HarmonyPatch(typeof(JsonablesHelper), "InventoryToJsonable")]
-    private static bool JsonablesHelper_InventoryToJsonable_Pre(Inventory __0, ref JsonableInventory __result)
-    {
-        if (StackSize.Value <= 1)
-        {
-            return true;
-        }
-
-        Inventory inventory = __0;
-        StringBuilder builder = new();
-        foreach (WorldObject worldObject in inventory.GetInsideWorldObjects())
-        {
-            if (builder.Length > 0)
-            {
-                builder.Append(',');
-            }
-
-            builder.Append(worldObject.GetId());
-        }
-
-        __result = new JsonableInventory(
-            inventory.GetId(),
-            builder.ToString(),
-            inventory.GetSize(),
-            GroupsHandler.GetGroupsStringIds(inventory.GetLogisticEntity().GetDemandGroups()),
-            GroupsHandler.GetGroupsStringIds(inventory.GetLogisticEntity().GetSupplyGroups()),
-            inventory.GetLogisticEntity().GetPriority());
-        return false;
-    }
-
-    [HarmonyPrefix]
-    [HarmonyPatch(typeof(InventoriesHandler), "UpdateOrCreateInventoryFromMessage")]
-    private static bool InventoriesHandler_UpdateOrCreateInventoryFromMessage_Pre(int size, int inventoryId, int[] content, int[] contentIds, Inventory newInventory, ref Inventory __result)
-    {
-        if (StackSize.Value <= 1)
-        {
-            return true;
-        }
-
-        Inventory inventory = newInventory ?? new Inventory(inventoryId, size, null, null, null, 0);
-        inventory.ClearContent(size);
-        List<WorldObject> restoredContent = (List<WorldObject>)AccessTools.Field(typeof(Inventory), "_worldObjectsInInventory").GetValue(inventory);
-
-        for (int i = 0; i < contentIds.Length; i++)
-        {
-            int worldObjectId = contentIds[i];
-            WorldObject worldObject = WorldObjectsHandler.Instance.GetWorldObjectViaId(worldObjectId);
-            if (worldObject == null && i < content.Length)
-            {
-                worldObject = WorldObjectsHandler.Instance.CreateNewWorldObject(GroupsHandler.GetGroupFromHash(content[i]), worldObjectId, null, true);
-            }
-
-            if (worldObject != null)
-            {
-                restoredContent.Add(worldObject);
-            }
-        }
-
-        __result = inventory;
         return false;
     }
 }
