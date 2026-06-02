@@ -13,7 +13,11 @@ using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.InputSystem;
 using UnityEngine.UI;
-
+using Unity.Netcode;
+using System.Runtime.CompilerServices;
+using System.Reflection;
+using System.Reflection.Emit;
+ 
 namespace SimpleStacking;
 
 [BepInPlugin(PluginGuid, PluginName, PluginVersion)]
@@ -21,7 +25,7 @@ public sealed class Plugin : BaseUnityPlugin
 {
     public const string PluginGuid = "local.theplanetcrafter.simplesting.v2";
     public const string PluginName = "Simple Stacking";
-    public const string PluginVersion = "1.1.2";
+    public const string PluginVersion = "1.1.5";
 
     private static readonly HashSet<int> AllowedContainerInventories = new();
     private static readonly string[] DefaultStorageNeedles = { "container", "storage", "locker", "chest" };
@@ -43,6 +47,7 @@ public sealed class Plugin : BaseUnityPlugin
     private static ConfigEntry<bool> StackGasExtractors;
 
     private static Plugin Instance;
+    private static Harmony _harmony;
     private static bool shiftTransferInProgress;
     private static readonly Dictionary<int, string> AllowFullMiningBackpackForStackId = new();
     private static Font font;
@@ -53,6 +58,11 @@ public sealed class Plugin : BaseUnityPlugin
     private static System.Reflection.MethodInfo onActionViaGamepadMethod;
     private static System.Reflection.MethodInfo onConsumeViaGamepadMethod;
     private static System.Reflection.MethodInfo onDropViaGamepadMethod;
+
+    private static System.Reflection.MethodInfo addNewItemClientRpcMethod;
+    private static System.Reflection.MethodInfo dirtyInventoryMethod;
+    private static System.Reflection.FieldInfo logisticTaskPrioritiesField;
+    private static System.Reflection.FieldInfo logisticDemandInventoriesField;
 
     private void Awake()
     {
@@ -83,7 +93,14 @@ public sealed class Plugin : BaseUnityPlugin
         onConsumeViaGamepadMethod = AccessTools.Method(typeof(InventoryDisplayer), "OnConsumeViaGamepad");
         onDropViaGamepadMethod = AccessTools.Method(typeof(InventoryDisplayer), "OnDropViaGamepad");
 
-        Harmony.CreateAndPatchAll(typeof(Plugin), PluginGuid);
+        addNewItemClientRpcMethod = AccessTools.Method(typeof(InventoriesHandler), "AddNewItemClientRpc");
+        dirtyInventoryMethod = AccessTools.Method(typeof(InventoriesHandler), "DirtyInventory");
+        logisticTaskPrioritiesField = AccessTools.Field(typeof(LogisticManager), "_taskPriorities");
+        logisticDemandInventoriesField = AccessTools.Field(typeof(LogisticManager), "_demandInventories");
+
+        _harmony = Harmony.CreateAndPatchAll(typeof(Plugin), PluginGuid);
+        PatchLogisticsStateMachine();
+
         Logger.LogInfo($"{PluginName} {PluginVersion} loaded for Planet Crafter v2.008");
         Logger.LogInfo($"Stacking enabled for: Ore Extractors={StackOreExtractors.Value}, Water Collectors={StackWaterCollectors.Value}, Gas Extractors={StackGasExtractors.Value}");
     }
@@ -524,6 +541,33 @@ public sealed class Plugin : BaseUnityPlugin
         }
     }
 
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(InventoriesHandler), "AddWorldObjectToInventory")]
+    private static void InventoriesHandler_AddWorldObjectToInventory_Pre(WorldObject worldObject, Inventory inventory)
+    {
+        try
+        {
+            if (!CanStack(inventory) || worldObject == null)
+            {
+                return;
+            }
+
+            // Очищаем старый флаг
+            AllowFullMiningBackpackForStackId.Remove(inventory.GetId());
+
+            // Если можно добавить в существующий неполный стак, устанавливаем флаг
+            if (CanReceiveWorldObjectInExistingStack(inventory, worldObject))
+            {
+                AllowFullMiningBackpackForStackId[inventory.GetId()] = GetStackId(worldObject);
+                DebugLog($"Allow adding item into visually full inventory {inventory.GetId()} for {GetStackId(worldObject)}");
+            }
+        }
+        catch (Exception ex)
+        {
+            DebugLog("Unable to prepare stack allowance for AddWorldObjectToInventory: " + ex.Message);
+        }
+    }
+
 	private static int GetStackCount(ReadOnlyCollection<WorldObject> items)
 	{
 		int stackSize = Math.Max(1, StackSize.Value);
@@ -553,6 +597,34 @@ public sealed class Plugin : BaseUnityPlugin
 		
 		return occupiedSlots;
 	}
+
+	public static int GetStackSlotCount(ReadOnlyCollection<WorldObject> items)
+	{
+		return GetStackCount(items);
+	}
+
+    private static bool IsExtractorInventory(Inventory inventory)
+    {
+        if (inventory == null) return false;
+        WorldObject owner = GetInventoryOwner(inventory);
+        if (owner == null) return false;
+        string groupId = owner.GetGroup()?.GetId() ?? "";
+        return groupId.StartsWith("OreExtractor") ||
+               groupId.StartsWith("WaterCollector") ||
+               groupId.StartsWith("GasExtractor");
+    }
+
+    private static bool IsSingleItemMachine(Inventory inventory)
+    {
+        if (inventory == null) return false;
+        WorldObject owner = GetInventoryOwner(inventory);
+        if (owner?.GetGameObject() == null) return false;
+        GameObject go = owner.GetGameObject();
+        return go.GetComponent<MachineConvertRecipe>() != null ||
+               go.GetComponent<MachineGrowerVegetationHarvestable>() != null ||
+               go.GetComponent<MachineGrowerIfLinkedGroup>() != null ||
+               go.GetComponent<MachineGrowerBase>() != null;
+    }
 
     private static void AddStackDisplay(GameObject slot, int amount)
     {
@@ -627,7 +699,17 @@ public sealed class Plugin : BaseUnityPlugin
             return false;
         }
 
-        __result = GetStackCount(__instance.GetInsideWorldObjects()) >= __instance.GetSize();
+        // Для экстракторов (руда/вода/газ) — total capacity (size * stackSize)
+        if (IsExtractorInventory(__instance))
+        {
+            int maxStack = Math.Max(1, StackSize.Value);
+            __result = __instance.GetInsideWorldObjects().Count >= __instance.GetSize() * maxStack;
+            return false;
+        }
+
+        // Для всего остального — визуальные слоты (size)
+        int usedSlots = GetStackSlotCount(__instance.GetInsideWorldObjects());
+        __result = usedSlots >= __instance.GetSize();
         return false;
     }
 
@@ -641,6 +723,12 @@ public sealed class Plugin : BaseUnityPlugin
 		ref bool __result)
 	{
 		if (!CanStack(__instance) || worldObject == null)
+		{
+			return true;
+		}
+
+		// Для однослотовых машин (Vegetube, Flower Seeder) — без стаков, vanilla логика
+		if (IsSingleItemMachine(__instance))
 		{
 			return true;
 		}
@@ -821,5 +909,126 @@ public sealed class Plugin : BaseUnityPlugin
         }
 
         return false;
+    }
+
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(InventoriesHandler), "AddNewItemToInventoryServerRpc")]
+    private static bool AddNewItemToInventoryServerRpc_Pre(
+        InventoriesHandler __instance,
+        int groupHash,
+        int inventoryId,
+        RpcParams rpcParams)
+    {
+        var stageField = AccessTools.Field(typeof(NetworkBehaviour), "__rpc_exec_stage");
+        var stageEnumType = stageField.FieldType;
+        var sendValue = Enum.Parse(stageEnumType, "Send");
+        var executeValue = Enum.Parse(stageEnumType, "Execute");
+
+        if (!stageField.GetValue(__instance).Equals(executeValue))
+            return true;
+
+        var inventory = InventoriesHandler.Instance.GetInventoryById(inventoryId);
+        if (inventory == null || !CanStack(inventory))
+            return true;
+
+        var group = GroupsHandler.GetGroupFromHash(groupHash);
+        var newWo = WorldObjectsHandler.Instance.CreateNewWorldObject(group, 0, null, true);
+        int woId = newWo.GetId();
+        bool result = inventory.AddItem(newWo, true);
+
+        if (result)
+        {
+            inventory.PropagateModification(newWo, true);
+            inventory.RefreshDisplayerContent();
+            dirtyInventoryMethod.Invoke(__instance, new object[] { inventoryId, rpcParams.Receive.SenderClientId, false });
+        }
+        else
+        {
+            WorldObjectsHandler.Instance.DestroyWorldObject(newWo, false);
+            DebugLog($"Destroyed orphan: {group.GetId()} (WO#{woId}) from inventory {inventoryId}");
+        }
+
+        var clientParams = NetworkUtils.GetSenderClientParams(rpcParams);
+        var args = new object[] { result, woId, clientParams };
+
+        stageField.SetValue(__instance, sendValue);
+        addNewItemClientRpcMethod.Invoke(__instance, args);
+
+        stageField.SetValue(__instance, executeValue);
+        addNewItemClientRpcMethod.Invoke(__instance, args);
+
+        return false;
+    }
+
+    private static void PatchLogisticsStateMachine()
+    {
+        var setLogisticTasks = AccessTools.Method(typeof(LogisticManager), "SetLogisticTasks");
+        var attr = setLogisticTasks?.GetCustomAttribute<IteratorStateMachineAttribute>();
+        var stateType = attr?.StateMachineType;
+        if (stateType == null) return;
+
+        var moveNext = AccessTools.Method(stateType, "MoveNext");
+        if (moveNext == null) return;
+
+        _harmony.Patch(moveNext, transpiler: new HarmonyMethod(
+            AccessTools.Method(typeof(Plugin), nameof(SetLogisticTasks_MoveNext_Transpiler))));
+    }
+
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(LogisticManager), "AddNewDemandInventory")]
+    private static bool AddNewDemandInventory_Pre(LogisticManager __instance, Inventory inventory)
+    {
+        if (inventory == null || !CanStack(inventory))
+            return true;
+
+        var priorities = (Dictionary<int, Dictionary<int, int>>)logisticTaskPrioritiesField.GetValue(__instance);
+        var demands = (List<Inventory>)logisticDemandInventoriesField.GetValue(__instance);
+
+        int usedSlots = GetStackSlotCount(inventory.GetInsideWorldObjects());
+        int freeSlots = Math.Max(0, inventory.GetSize() - usedSlots - inventory.GetLogisticEntity().waitingDemandSlots);
+
+        if (freeSlots > 0 && priorities.ContainsKey(inventory.GetLogisticEntity().GetPlanetHash()))
+        {
+            foreach (Group demandGroup in inventory.GetLogisticEntity().GetDemandGroups())
+            {
+                int num;
+                if (!priorities[inventory.GetLogisticEntity().GetPlanetHash()].TryGetValue(demandGroup.stableHashCode, out num) || num < inventory.GetLogisticEntity().GetPriority())
+                    priorities[inventory.GetLogisticEntity().GetPlanetHash()][demandGroup.stableHashCode] = inventory.GetLogisticEntity().GetPriority();
+            }
+        }
+
+        for (int index = 0; index < demands.Count; ++index)
+        {
+            if (inventory.GetLogisticEntity().GetPriority() >= demands[index].GetLogisticEntity().GetPriority())
+            {
+                demands.Insert(index, inventory);
+                return false;
+            }
+        }
+        demands.Add(inventory);
+        return false;
+    }
+
+    private static IEnumerable<CodeInstruction> SetLogisticTasks_MoveNext_Transpiler(IEnumerable<CodeInstruction> instructions)
+    {
+        var codes = instructions.ToList();
+        var getInsideWorldObjects = AccessTools.Method(typeof(Inventory), "GetInsideWorldObjects");
+        var getCount = typeof(ReadOnlyCollection<WorldObject>).GetMethod("get_Count");
+        var stackCount = AccessTools.Method(typeof(Plugin), nameof(GetStackSlotCount));
+
+        for (int i = 0; i < codes.Count - 2; i++)
+        {
+            if (codes[i].opcode == OpCodes.Callvirt &&
+                codes[i].operand is System.Reflection.MethodBase m1 &&
+                m1 == getInsideWorldObjects &&
+                codes[i + 1].opcode == OpCodes.Callvirt &&
+                codes[i + 1].operand is System.Reflection.MethodBase m2 &&
+                m2 == getCount &&
+                codes[i + 2].opcode == OpCodes.Sub)
+            {
+                codes[i + 1] = new CodeInstruction(OpCodes.Call, stackCount);
+            }
+        }
+        return codes;
     }
 }
