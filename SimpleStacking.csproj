@@ -10,7 +10,7 @@
     <OutputPath>bin\Release\</OutputPath>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
 	
-	<Version>1.1.2</Version>
+	<Version>1.1.5</Version>
   </PropertyGroup>
 
   <ItemGroup>
