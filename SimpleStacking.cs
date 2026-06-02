@@ -21,7 +21,7 @@ public sealed class Plugin : BaseUnityPlugin
 {
     public const string PluginGuid = "local.theplanetcrafter.simplesting.v2";
     public const string PluginName = "Simple Stacking";
-    public const string PluginVersion = "1.1.1";
+    public const string PluginVersion = "1.1.2";
 
     private static readonly HashSet<int> AllowedContainerInventories = new();
     private static readonly string[] DefaultStorageNeedles = { "container", "storage", "locker", "chest" };
@@ -44,6 +44,7 @@ public sealed class Plugin : BaseUnityPlugin
 
     private static Plugin Instance;
     private static bool shiftTransferInProgress;
+    private static readonly Dictionary<int, string> AllowFullMiningBackpackForStackId = new();
     private static Font font;
     
     // Рефлексия для доступа к protected методам
@@ -411,6 +412,33 @@ public sealed class Plugin : BaseUnityPlugin
         return HasFreeVisibleSlot(inventory) || GetPartialStackSpace(inventory, stackId, stackSize) > 0;
     }
 
+    private static bool TryAddStackedWorldObject(Inventory inventory, WorldObject worldObject, bool resetPositionAndRotation)
+    {
+        if (!CanStack(inventory) || worldObject == null)
+        {
+            return false;
+        }
+
+        string stackId = GetStackId(worldObject);
+        int stackSize = Math.Max(1, StackSize.Value);
+        if (!CanReceiveStackItem(inventory, stackId, stackSize))
+        {
+            return false;
+        }
+
+        return inventory.AddItem(worldObject, resetPositionAndRotation);
+    }
+
+    private static bool CanReceiveWorldObjectInExistingStack(Inventory inventory, WorldObject worldObject)
+    {
+        if (!CanStack(inventory) || worldObject == null)
+        {
+            return false;
+        }
+
+        return GetPartialStackSpace(inventory, GetStackId(worldObject), Math.Max(1, StackSize.Value)) > 0;
+    }
+
     private static IEnumerator TransferItems(Inventory from, Inventory to, List<WorldObject> items, string stackId)
     {
         shiftTransferInProgress = true;
@@ -468,6 +496,31 @@ public sealed class Plugin : BaseUnityPlugin
         {
             Log.LogWarning("Shift stack transfer failed before vanilla click: " + ex);
             return true;
+        }
+    }
+
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(ActionMinable), "OnAction")]
+    private static void ActionMinable_OnAction_Pre(ActionMinable __instance)
+    {
+        try
+        {
+            WorldObject worldObject = __instance.GetComponent<WorldObjectAssociated>()?.GetWorldObject();
+            Inventory backpack = Managers.GetManager<PlayersManager>()?.GetActivePlayerController()?.GetPlayerBackpack()?.GetInventory();
+            if (backpack != null)
+            {
+                AllowFullMiningBackpackForStackId.Remove(backpack.GetId());
+            }
+
+            if (CanReceiveWorldObjectInExistingStack(backpack, worldObject))
+            {
+                AllowFullMiningBackpackForStackId[backpack.GetId()] = GetStackId(worldObject);
+                DebugLog($"Allow mining into visually full backpack {backpack.GetId()} for {GetStackId(worldObject)}");
+            }
+        }
+        catch (Exception ex)
+        {
+            DebugLog("Unable to prepare mining stack allowance: " + ex.Message);
         }
     }
 
@@ -566,6 +619,13 @@ public sealed class Plugin : BaseUnityPlugin
     private static bool Inventory_IsFull_Pre(Inventory __instance, ref bool __result)
     {
         if (!CanStack(__instance)) return true;
+
+        if (AllowFullMiningBackpackForStackId.TryGetValue(__instance.GetId(), out string stackId) &&
+            GetPartialStackSpace(__instance, stackId, Math.Max(1, StackSize.Value)) > 0)
+        {
+            __result = false;
+            return false;
+        }
 
         __result = GetStackCount(__instance.GetInsideWorldObjects()) >= __instance.GetSize();
         return false;
