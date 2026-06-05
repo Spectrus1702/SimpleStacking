@@ -25,7 +25,7 @@ public sealed class Plugin : BaseUnityPlugin
 {
     public const string PluginGuid = "local.theplanetcrafter.simplesting.v2";
     public const string PluginName = "Simple Stacking";
-    public const string PluginVersion = "1.1.5";
+    public const string PluginVersion = "1.2.1";
 
     private static readonly HashSet<int> AllowedContainerInventories = new();
     private static readonly string[] DefaultStorageNeedles = { "container", "storage", "locker", "chest" };
@@ -49,7 +49,7 @@ public sealed class Plugin : BaseUnityPlugin
     private static Plugin Instance;
     private static Harmony _harmony;
     private static bool shiftTransferInProgress;
-    private static readonly Dictionary<int, string> AllowFullMiningBackpackForStackId = new();
+
     private static Font font;
     
     // Рефлексия для доступа к protected методам
@@ -129,6 +129,9 @@ public sealed class Plugin : BaseUnityPlugin
         {
             return StackOpenedContainers.Value;
         }
+
+        if (inventory.GetAuthorizedGroups()?.Count > 0)
+            return false;
 
         WorldObject owner = GetInventoryOwner(inventory);
         if (owner == null)
@@ -446,16 +449,6 @@ public sealed class Plugin : BaseUnityPlugin
         return inventory.AddItem(worldObject, resetPositionAndRotation);
     }
 
-    private static bool CanReceiveWorldObjectInExistingStack(Inventory inventory, WorldObject worldObject)
-    {
-        if (!CanStack(inventory) || worldObject == null)
-        {
-            return false;
-        }
-
-        return GetPartialStackSpace(inventory, GetStackId(worldObject), Math.Max(1, StackSize.Value)) > 0;
-    }
-
     private static IEnumerator TransferItems(Inventory from, Inventory to, List<WorldObject> items, string stackId)
     {
         shiftTransferInProgress = true;
@@ -507,6 +500,11 @@ public sealed class Plugin : BaseUnityPlugin
                 return true;
             }
 
+            // Клиенты не могут напрямую модифицировать инвентари (нет RPC для трансфера стака).
+            // Пропускаем shift-click → ванильный OnImageClicked обработает 1 предмет через сеть.
+            if (!NetworkManager.Singleton.IsHost)
+                return true;
+
             return !TryTransferStackOnShiftClick(__instance, eventTriggerCallbackData);
         }
         catch (Exception ex)
@@ -516,59 +514,7 @@ public sealed class Plugin : BaseUnityPlugin
         }
     }
 
-    [HarmonyPrefix]
-    [HarmonyPatch(typeof(ActionMinable), "OnAction")]
-    private static void ActionMinable_OnAction_Pre(ActionMinable __instance)
-    {
-        try
-        {
-            WorldObject worldObject = __instance.GetComponent<WorldObjectAssociated>()?.GetWorldObject();
-            Inventory backpack = Managers.GetManager<PlayersManager>()?.GetActivePlayerController()?.GetPlayerBackpack()?.GetInventory();
-            if (backpack != null)
-            {
-                AllowFullMiningBackpackForStackId.Remove(backpack.GetId());
-            }
-
-            if (CanReceiveWorldObjectInExistingStack(backpack, worldObject))
-            {
-                AllowFullMiningBackpackForStackId[backpack.GetId()] = GetStackId(worldObject);
-                DebugLog($"Allow mining into visually full backpack {backpack.GetId()} for {GetStackId(worldObject)}");
-            }
-        }
-        catch (Exception ex)
-        {
-            DebugLog("Unable to prepare mining stack allowance: " + ex.Message);
-        }
-    }
-
-    [HarmonyPrefix]
-    [HarmonyPatch(typeof(InventoriesHandler), "AddWorldObjectToInventory")]
-    private static void InventoriesHandler_AddWorldObjectToInventory_Pre(WorldObject worldObject, Inventory inventory)
-    {
-        try
-        {
-            if (!CanStack(inventory) || worldObject == null)
-            {
-                return;
-            }
-
-            // Очищаем старый флаг
-            AllowFullMiningBackpackForStackId.Remove(inventory.GetId());
-
-            // Если можно добавить в существующий неполный стак, устанавливаем флаг
-            if (CanReceiveWorldObjectInExistingStack(inventory, worldObject))
-            {
-                AllowFullMiningBackpackForStackId[inventory.GetId()] = GetStackId(worldObject);
-                DebugLog($"Allow adding item into visually full inventory {inventory.GetId()} for {GetStackId(worldObject)}");
-            }
-        }
-        catch (Exception ex)
-        {
-            DebugLog("Unable to prepare stack allowance for AddWorldObjectToInventory: " + ex.Message);
-        }
-    }
-
-	private static int GetStackCount(ReadOnlyCollection<WorldObject> items)
+    private static int GetStackCount(ReadOnlyCollection<WorldObject> items)
 	{
 		int stackSize = Math.Max(1, StackSize.Value);
 		Dictionary<string, int> stackCounts = new Dictionary<string, int>();
@@ -685,19 +631,11 @@ public sealed class Plugin : BaseUnityPlugin
         AllowedContainerInventories.Remove(inventoryId);
     }
 
-    // Патч для IsFull - учитывает стаки
     [HarmonyPrefix]
     [HarmonyPatch(typeof(Inventory), "IsFull")]
     private static bool Inventory_IsFull_Pre(Inventory __instance, ref bool __result)
     {
         if (!CanStack(__instance)) return true;
-
-        if (AllowFullMiningBackpackForStackId.TryGetValue(__instance.GetId(), out string stackId) &&
-            GetPartialStackSpace(__instance, stackId, Math.Max(1, StackSize.Value)) > 0)
-        {
-            __result = false;
-            return false;
-        }
 
         // Для экстракторов (руда/вода/газ) — total capacity (size * stackSize)
         if (IsExtractorInventory(__instance))
@@ -707,9 +645,37 @@ public sealed class Plugin : BaseUnityPlugin
             return false;
         }
 
-        // Для всего остального — визуальные слоты (size)
-        int usedSlots = GetStackSlotCount(__instance.GetInsideWorldObjects());
-        __result = usedSlots >= __instance.GetSize();
+        int stackSize = Math.Max(1, StackSize.Value);
+        var items = __instance.GetInsideWorldObjects();
+        Dictionary<string, int> stackCounts = new();
+        int usedSlots = 0;
+
+        foreach (WorldObject item in items)
+        {
+            if (item == null) continue;
+            string stackId = GetStackId(item);
+            if (!stackCounts.ContainsKey(stackId))
+            {
+                stackCounts[stackId] = 0;
+                usedSlots++;
+            }
+            stackCounts[stackId]++;
+            if (stackCounts[stackId] > stackSize)
+            {
+                usedSlots++;
+                stackCounts[stackId] -= stackSize;
+            }
+        }
+
+        // Есть свободные слоты — точно не полный
+        if (usedSlots < __instance.GetSize())
+        {
+            __result = false;
+            return false;
+        }
+
+        // Все слоты заняты — не полный, если есть неполные стаки
+        __result = !stackCounts.Values.Any(c => c < stackSize);
         return false;
     }
 
