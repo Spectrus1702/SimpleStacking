@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.IO;
 using System.Linq;
 using System.Text;
 using BepInEx;
@@ -25,30 +26,20 @@ public sealed class Plugin : BaseUnityPlugin
 {
     public const string PluginGuid = "local.theplanetcrafter.simplesting.v2";
     public const string PluginName = "Simple Stacking";
-    public const string PluginVersion = "1.2.1";
-
-    private static readonly HashSet<int> AllowedContainerInventories = new();
-    private static readonly string[] DefaultStorageNeedles = { "container", "storage", "locker", "chest" };
+    public const string PluginVersion = "1.3.0";
 
     private static ManualLogSource Log;
     private static ConfigEntry<int> StackSize;
     private static ConfigEntry<int> FontSize;
     private static ConfigEntry<float> OffsetX;
     private static ConfigEntry<float> OffsetY;
-    private static ConfigEntry<bool> StackBackpack;
-    private static ConfigEntry<bool> StackOpenedContainers;
-    private static ConfigEntry<string> StorageGroupIdContains;
     private static ConfigEntry<bool> DebugMode;
     private static ConfigEntry<bool> AlignLeft;
     private static ConfigEntry<float> CounterWidth;
-    
-    private static ConfigEntry<bool> StackOreExtractors;
-    private static ConfigEntry<bool> StackWaterCollectors;
-    private static ConfigEntry<bool> StackGasExtractors;
-
     private static Plugin Instance;
     private static Harmony _harmony;
     private static bool shiftTransferInProgress;
+    private static readonly Dictionary<string, ConfigEntry<bool>> containerOverrides = new();
 
     private static Font font;
     
@@ -74,15 +65,8 @@ public sealed class Plugin : BaseUnityPlugin
         OffsetX = Config.Bind("General", "OffsetX", -2f, "Move stack counter horizontally.");
         OffsetY = Config.Bind("General", "OffsetY", 2f, "Move stack counter vertically.");
         AlignLeft = Config.Bind("General", "AlignLeft", false, "Align stack counter to the left instead of the right.");
-        StackBackpack = Config.Bind("General", "StackBackpack", true, "Allow stacking in the player backpack.");
-        StackOpenedContainers = Config.Bind("General", "StackOpenedContainers", true, "Allow stacking in opened storage/container inventories.");
-        StorageGroupIdContains = Config.Bind("General", "StorageGroupIdContains", "container,storage,locker,chest", "Comma-separated owner group-id fragments treated as storage.");
         DebugMode = Config.Bind("General", "DebugMode", false, "Write detailed diagnostic logs.");
         CounterWidth = Config.Bind("General", "CounterWidth", 40f, "Width of stack counter area.");
-        
-        StackOreExtractors = Config.Bind("Machines", "StackOreExtractors", true, "Allow stacking in Ore Extractors (OreExtractor1, OreExtractor2, OreExtractor3).");
-        StackWaterCollectors = Config.Bind("Machines", "StackWaterCollectors", true, "Allow stacking in Water Collectors (WaterCollector1, WaterCollector2).");
-        StackGasExtractors = Config.Bind("Machines", "StackGasExtractors", true, "Allow stacking in Gas Extractors (GasExtractor1, GasExtractor2).");
 
         font = Resources.GetBuiltinResource<Font>("Arial.ttf");
         
@@ -102,7 +86,38 @@ public sealed class Plugin : BaseUnityPlugin
         PatchLogisticsStateMachine();
 
         Logger.LogInfo($"{PluginName} {PluginVersion} loaded for Planet Crafter v2.008");
-        Logger.LogInfo($"Stacking enabled for: Ore Extractors={StackOreExtractors.Value}, Water Collectors={StackWaterCollectors.Value}, Gas Extractors={StackGasExtractors.Value}");
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(ConfigFile), "Save")]
+    private static void ConfigFile_Save_Post()
+    {
+        try
+        {
+            string path = Instance.Config.ConfigFilePath;
+            if (!File.Exists(path)) return;
+
+            string[] lines = File.ReadAllLines(path);
+            var result = new List<string>();
+            bool inSection = false;
+
+            foreach (string line in lines)
+            {
+                string t = line.TrimStart();
+                if (t.StartsWith("["))
+                {
+                    inSection = (t == "[AllowContainers]");
+                    result.Add(line);
+                    continue;
+                }
+                if (inSection && (t.StartsWith("#") || t.StartsWith("##")))
+                    continue;
+                result.Add(line);
+            }
+
+            File.WriteAllLines(path, result.ToArray());
+        }
+        catch { }
     }
 
     private static void DebugLog(string message)
@@ -116,37 +131,22 @@ public sealed class Plugin : BaseUnityPlugin
     private static bool CanStack(Inventory inventory)
     {
         if (inventory == null || StackSize.Value <= 1)
-        {
-            return false;
-        }
-
-        if (IsPlayerBackpack(inventory))
-        {
-            return StackBackpack.Value;
-        }
-
-        if (AllowedContainerInventories.Contains(inventory.GetId()))
-        {
-            return StackOpenedContainers.Value;
-        }
-
-        if (inventory.GetAuthorizedGroups()?.Count > 0)
             return false;
 
         WorldObject owner = GetInventoryOwner(inventory);
-        if (owner == null)
-        {
-            return true;
-        }
+        string groupId = owner?.GetGroup()?.GetId() ?? "";
 
-        string groupId = owner.GetGroup()?.GetId() ?? "";
-        
-        if (groupId.StartsWith("OreExtractor"))
-            return StackOreExtractors.Value;
-        if (groupId.StartsWith("WaterCollector"))
-            return StackWaterCollectors.Value;
-        if (groupId.StartsWith("GasExtractor"))
-            return StackGasExtractors.Value;
+        if (!string.IsNullOrEmpty(groupId))
+        {
+            if (containerOverrides.TryGetValue(groupId, out ConfigEntry<bool> overrideEntry))
+                return overrideEntry.Value;
+
+            bool stackingAllowed = (inventory.GetAuthorizedGroups()?.Count ?? 0) == 0;
+            ConfigEntry<bool> entry = Instance.Config.Bind("AllowContainers", groupId, stackingAllowed, "");
+            containerOverrides[groupId] = entry;
+            Instance.Config.Save();
+            return stackingAllowed;
+        }
 
         return true;
     }
@@ -159,8 +159,6 @@ public sealed class Plugin : BaseUnityPlugin
 
     private static bool IsPlayerBackpack(Inventory inventory)
     {
-        if (!StackBackpack.Value) return false;
-
         try
         {
             PlayersManager players = Managers.GetManager<PlayersManager>();
@@ -179,32 +177,6 @@ public sealed class Plugin : BaseUnityPlugin
         catch { return false; }
 
         return false;
-    }
-
-    private static bool LooksLikeStorage(WorldObject owner)
-    {
-        string id = owner?.GetGroup()?.GetId();
-        if (string.IsNullOrEmpty(id)) return false;
-
-        string lower = id.ToLowerInvariant();
-        var needles = StorageGroupIdContains.Value
-            .Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
-            .Select(s => s.Trim().ToLowerInvariant())
-            .Where(s => s.Length != 0);
-
-        return needles.DefaultIfEmpty().Any(needle => lower.Contains(needle))
-            || DefaultStorageNeedles.Any(needle => lower.Contains(needle));
-    }
-
-    private static void AllowContainerInventory(Inventory inventory, WorldObject owner, string source)
-    {
-        if (!StackOpenedContainers.Value || inventory == null) return;
-
-        if (LooksLikeStorage(owner))
-        {
-            AllowedContainerInventories.Add(inventory.GetId());
-            DebugLog($"Allowed inventory {inventory.GetId()} from {source}, owner group {owner.GetGroup().GetId()}");
-        }
     }
 
     private static string GetStackId(WorldObject worldObject)
@@ -341,36 +313,17 @@ public sealed class Plugin : BaseUnityPlugin
         return fallback != from ? fallback : null;
     }
 
-    private static List<WorldObject> FindSlotForStackTransfer(Inventory from, WorldObject clickedItem, string stackId, bool preferFullStack)
+    private static List<WorldObject> FindSlotForStackTransfer(Inventory from, WorldObject clickedItem, string stackId)
     {
-        int stackSize = Math.Max(1, StackSize.Value);
-        List<WorldObject> clickedSlot = null;
-        List<WorldObject> fullSlot = null;
-
         foreach (List<WorldObject> slot in CreateInventorySlots(from.GetInsideWorldObjects()))
         {
-            if (slot.Count == 0 || GetStackId(slot[0]) != stackId)
+            if (slot.Count > 0 && GetStackId(slot[0]) == stackId && slot.Contains(clickedItem))
             {
-                continue;
-            }
-
-            if (slot.Contains(clickedItem))
-            {
-                clickedSlot = slot;
-            }
-
-            if (fullSlot == null && slot.Count >= stackSize)
-            {
-                fullSlot = slot;
+                return slot;
             }
         }
 
-        if (preferFullStack && clickedSlot != null && clickedSlot.Count < stackSize && fullSlot != null)
-        {
-            return fullSlot;
-        }
-
-        return clickedSlot ?? fullSlot;
+        return null;
     }
 
     private static bool TryTransferStackOnShiftClick(InventoryDisplayer displayer, EventTriggerCallbackData eventData)
@@ -409,7 +362,7 @@ public sealed class Plugin : BaseUnityPlugin
             return true;
         }
 
-        List<WorldObject> sourceSlot = FindSlotForStackTransfer(from, eventData.worldObject, stackId, targetHasFreeSlot);
+        List<WorldObject> sourceSlot = FindSlotForStackTransfer(from, eventData.worldObject, stackId);
         if (sourceSlot == null || sourceSlot.Count == 0)
         {
             return true;
@@ -549,17 +502,6 @@ public sealed class Plugin : BaseUnityPlugin
 		return GetStackCount(items);
 	}
 
-    private static bool IsExtractorInventory(Inventory inventory)
-    {
-        if (inventory == null) return false;
-        WorldObject owner = GetInventoryOwner(inventory);
-        if (owner == null) return false;
-        string groupId = owner.GetGroup()?.GetId() ?? "";
-        return groupId.StartsWith("OreExtractor") ||
-               groupId.StartsWith("WaterCollector") ||
-               groupId.StartsWith("GasExtractor");
-    }
-
     private static bool IsSingleItemMachine(Inventory inventory)
     {
         if (inventory == null) return false;
@@ -598,52 +540,11 @@ public sealed class Plugin : BaseUnityPlugin
         rect.anchoredPosition = new Vector2(-4f + OffsetX.Value, 2f + OffsetY.Value);
     }
 
-    // Патчи для контейнеров
-    [HarmonyPrefix]
-    [HarmonyPatch(typeof(ActionOpenable), "OpenInventories")]
-    private static void ActionOpenable_OpenInventories_Pre(ActionOpenable __instance, Inventory objectInventory, WorldObject worldObject)
-    {
-        if (!__instance.notAContainer)
-        {
-            AllowContainerInventory(objectInventory, worldObject, "ActionOpenable");
-        }
-    }
-
-    [HarmonyPostfix]
-    [HarmonyPatch(typeof(UiWindowContainer), "SetInventories")]
-    private static void UiWindowContainer_SetInventories_Post(Inventory inventoryRight)
-    {
-        try
-        {
-            WorldObject owner = WorldObjectsHandler.Instance?.GetWorldObjectForInventory(inventoryRight);
-            AllowContainerInventory(inventoryRight, owner, "UiWindowContainer");
-        }
-        catch (Exception ex)
-        {
-            DebugLog("Unable to resolve container owner: " + ex.Message);
-        }
-    }
-
-    [HarmonyPostfix]
-    [HarmonyPatch(typeof(InventoriesHandler), "DestroyInventory")]
-    private static void InventoriesHandler_DestroyInventory_Post(int inventoryId)
-    {
-        AllowedContainerInventories.Remove(inventoryId);
-    }
-
     [HarmonyPrefix]
     [HarmonyPatch(typeof(Inventory), "IsFull")]
     private static bool Inventory_IsFull_Pre(Inventory __instance, ref bool __result)
     {
         if (!CanStack(__instance)) return true;
-
-        // Для экстракторов (руда/вода/газ) — total capacity (size * stackSize)
-        if (IsExtractorInventory(__instance))
-        {
-            int maxStack = Math.Max(1, StackSize.Value);
-            __result = __instance.GetInsideWorldObjects().Count >= __instance.GetSize() * maxStack;
-            return false;
-        }
 
         int stackSize = Math.Max(1, StackSize.Value);
         var items = __instance.GetInsideWorldObjects();
