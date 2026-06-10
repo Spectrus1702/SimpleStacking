@@ -26,7 +26,7 @@ public sealed class Plugin : BaseUnityPlugin
 {
     public const string PluginGuid = "local.theplanetcrafter.simplesting.v2";
     public const string PluginName = "Simple Stacking";
-    public const string PluginVersion = "1.3.0";
+    public const string PluginVersion = "1.3.2";
 
     private static ManualLogSource Log;
     private static ConfigEntry<int> StackSize;
@@ -40,6 +40,7 @@ public sealed class Plugin : BaseUnityPlugin
     private static Harmony _harmony;
     private static bool shiftTransferInProgress;
     private static readonly Dictionary<string, ConfigEntry<bool>> containerOverrides = new();
+    private static int addRejectCount;
 
     private static Font font;
     
@@ -594,6 +595,9 @@ public sealed class Plugin : BaseUnityPlugin
 			return true;
 		}
 
+		if (NetworkManager.Singleton != null && !NetworkManager.Singleton.IsServer)
+			return true;
+
 		// Для однослотовых машин (Vegetube, Flower Seeder) — без стаков, vanilla логика
 		if (IsSingleItemMachine(__instance))
 		{
@@ -664,6 +668,15 @@ public sealed class Plugin : BaseUnityPlugin
 		
 		if (!canAdd)
 		{
+			if (DebugMode.Value)
+			{
+				string ownerGroup = GetInventoryOwner(__instance)?.GetGroup()?.GetId() ?? "?";
+				addRejectCount++;
+				Log.LogInfo($"[STACK REJECT #{addRejectCount}] invId={__instance.GetId()} group={ownerGroup}" +
+					$" stackId={newStackId} usedSlots={usedSlots}/{__instance.GetSize()}" +
+					$" freeSlots={__instance.GetSize() - usedSlots}" +
+					$" hasStack={stackCounts.ContainsKey(newStackId)}");
+			}
 			__result = false;
 			return false;
 		}
