@@ -24,23 +24,21 @@ namespace SimpleStacking;
 [BepInPlugin(PluginGuid, PluginName, PluginVersion)]
 public sealed class Plugin : BaseUnityPlugin
 {
-    public const string PluginGuid = "local.theplanetcrafter.simplesting.v2";
-    public const string PluginName = "Simple Stacking";
-    public const string PluginVersion = "1.3.2";
+    public const string PluginGuid = "spectrus.simplestacking";
+    public const string PluginName = "SimpleStacking";
+    public const string PluginVersion = "1.4.0";
 
     private static ManualLogSource Log;
     private static ConfigEntry<int> StackSize;
     private static ConfigEntry<int> FontSize;
-    private static ConfigEntry<float> OffsetX;
-    private static ConfigEntry<float> OffsetY;
+    private static ConfigEntry<string> CounterPosition;
     private static ConfigEntry<bool> DebugMode;
-    private static ConfigEntry<bool> AlignLeft;
-    private static ConfigEntry<float> CounterWidth;
     private static Plugin Instance;
     private static Harmony _harmony;
     private static bool shiftTransferInProgress;
     private static readonly Dictionary<string, ConfigEntry<bool>> containerOverrides = new();
     private static int addRejectCount;
+    private static bool bulkCraftInProgress;
 
     private static Font font;
     
@@ -55,6 +53,9 @@ public sealed class Plugin : BaseUnityPlugin
     private static System.Reflection.MethodInfo dirtyInventoryMethod;
     private static System.Reflection.FieldInfo logisticTaskPrioritiesField;
     private static System.Reflection.FieldInfo logisticDemandInventoriesField;
+    private static System.Reflection.FieldInfo uiWindowCraft_SourceCrafter;
+    private static System.Reflection.FieldInfo uiWindowCraft_CanCraft;
+    private static System.Reflection.FieldInfo uiWindowCraft_PreviousGroupCrafted;
 
     private void Awake()
     {
@@ -63,11 +64,8 @@ public sealed class Plugin : BaseUnityPlugin
         
         StackSize = Config.Bind("General", "StackSize", 10, "How many equal items fit into one visible slot.");
         FontSize = Config.Bind("General", "FontSize", 15, "Stack counter font size.");
-        OffsetX = Config.Bind("General", "OffsetX", -2f, "Move stack counter horizontally.");
-        OffsetY = Config.Bind("General", "OffsetY", 2f, "Move stack counter vertically.");
-        AlignLeft = Config.Bind("General", "AlignLeft", false, "Align stack counter to the left instead of the right.");
+        CounterPosition = Config.Bind("General", "CounterPosition", "BottomRight", "Stack counter position: BottomRight, BottomLeft, TopRight, TopLeft");
         DebugMode = Config.Bind("General", "DebugMode", false, "Write detailed diagnostic logs.");
-        CounterWidth = Config.Bind("General", "CounterWidth", 40f, "Width of stack counter area.");
 
         font = Resources.GetBuiltinResource<Font>("Arial.ttf");
         
@@ -82,6 +80,10 @@ public sealed class Plugin : BaseUnityPlugin
         dirtyInventoryMethod = AccessTools.Method(typeof(InventoriesHandler), "DirtyInventory");
         logisticTaskPrioritiesField = AccessTools.Field(typeof(LogisticManager), "_taskPriorities");
         logisticDemandInventoriesField = AccessTools.Field(typeof(LogisticManager), "_demandInventories");
+
+        uiWindowCraft_SourceCrafter = AccessTools.Field(typeof(UiWindowCraft), "sourceCrafter");
+        uiWindowCraft_CanCraft = AccessTools.Field(typeof(UiWindowCraft), "canCraft");
+        uiWindowCraft_PreviousGroupCrafted = AccessTools.Field(typeof(UiWindowCraft), "previousGroupCrafted");
 
         _harmony = Harmony.CreateAndPatchAll(typeof(Plugin), PluginGuid);
         PatchLogisticsStateMachine();
@@ -267,6 +269,35 @@ public sealed class Plugin : BaseUnityPlugin
     {
         Keyboard keyboard = Keyboard.current;
         return keyboard != null && (keyboard.leftShiftKey.isPressed || keyboard.rightShiftKey.isPressed);
+    }
+
+    private static int CalculateMaxCraftable(Inventory backpack, List<Group> ingredients)
+    {
+        Dictionary<string, int> available = new();
+        foreach (WorldObject wo in backpack.GetInsideWorldObjects())
+        {
+            if (wo != null)
+            {
+                string id = wo.GetGroup().GetId();
+                available[id] = available.GetValueOrDefault(id) + 1;
+            }
+        }
+
+        Dictionary<string, int> required = new();
+        foreach (Group g in ingredients)
+        {
+            string id = g.GetId();
+            required[id] = required.GetValueOrDefault(id) + 1;
+        }
+
+        int max = int.MaxValue;
+        foreach (var kv in required)
+        {
+            int have = available.GetValueOrDefault(kv.Key);
+            max = Math.Min(max, have / kv.Value);
+        }
+
+        return max == int.MaxValue ? 0 : max;
     }
 
     private static int GetPartialStackSpace(Inventory inventory, string stackId, int stackSize)
@@ -468,6 +499,95 @@ public sealed class Plugin : BaseUnityPlugin
         }
     }
 
+    [HarmonyPrefix]
+    [HarmonyPatch(typeof(UiWindowCraft), "OnImageClicked")]
+    private static bool UiWindowCraft_OnImageClicked_Pre(UiWindowCraft __instance, EventTriggerCallbackData _eventTriggerCallbackData)
+    {
+        try
+        {
+            if (!IsShiftPressed() || bulkCraftInProgress)
+                return true;
+
+            if (_eventTriggerCallbackData.pointerEventData == null ||
+                _eventTriggerCallbackData.pointerEventData.button != PointerEventData.InputButton.Left)
+                return true;
+
+            GroupItem group = _eventTriggerCallbackData.group as GroupItem;
+            if (group == null)
+                return true;
+
+            if (group.GetCraftedInWorld())
+                return true;
+
+            bool canCraft = (bool)uiWindowCraft_CanCraft.GetValue(__instance);
+            bool everythingUnlocked = Managers.GetManager<GameSettingsHandler>().GetCurrentGameSettings().GetEverythingUnlocked();
+            if (!canCraft && !everythingUnlocked)
+                return false;
+
+            PlayerMainController player = Managers.GetManager<PlayersManager>().GetActivePlayerController();
+            if (player == null) return true;
+
+            Inventory backpack = player.GetPlayerBackpack()?.GetInventory();
+            if (backpack == null) return true;
+
+            List<Group> ingredients = group.GetRecipe()?.GetIngredientsGroupInRecipe();
+            if (ingredients == null || ingredients.Count == 0)
+                return true;
+
+            GameSettingsHandler settings = Managers.GetManager<GameSettingsHandler>();
+            bool freeCraft = settings.GetCurrentGameSettings().GetFreeCraft();
+
+            int maxCraftable;
+            if (freeCraft)
+            {
+                maxCraftable = Math.Max(1, StackSize.Value);
+            }
+            else
+            {
+                maxCraftable = CalculateMaxCraftable(backpack, ingredients);
+            }
+
+            if (maxCraftable <= 1)
+                return true;
+
+            ActionCrafter sourceCrafter = (ActionCrafter)uiWindowCraft_SourceCrafter.GetValue(__instance);
+            if (sourceCrafter == null)
+                return true;
+
+            bulkCraftInProgress = true;
+
+            sourceCrafter.CraftAnimation(group);
+
+            List<Group> allIngredients = new(ingredients.Count * maxCraftable);
+            for (int i = 0; i < maxCraftable; i++)
+                allIngredients.AddRange(ingredients);
+
+            InventoriesHandler.Instance.RemoveItemsFromInventory(allIngredients, backpack, destroy: true, displayInformation: true);
+
+            for (int i = 0; i < maxCraftable; i++)
+                InventoriesHandler.Instance.AddItemToInventory(group, backpack, null);
+
+            for (int i = 0; i < maxCraftable; i++)
+                WorldObjectsHandler.Instance.AddOneToTotalCraft();
+
+            uiWindowCraft_PreviousGroupCrafted.SetValue(__instance, group);
+
+            if (!player.GetPlayerInputDispatcher().IsPressingAccessibilityKey())
+                __instance.CloseAll();
+
+            return false;
+        }
+        catch (Exception ex)
+        {
+            DebugLog($"Bulk craft error: {ex}");
+            return true;
+        }
+        finally
+        {
+            bulkCraftInProgress = false;
+        }
+    }
+
     private static int GetStackCount(ReadOnlyCollection<WorldObject> items)
 	{
 		int stackSize = Math.Max(1, StackSize.Value);
@@ -524,7 +644,6 @@ public sealed class Plugin : BaseUnityPlugin
         text.font = font;
         text.fontSize = FontSize.Value;
         text.fontStyle = FontStyle.Bold;
-        text.alignment = AlignLeft.Value ? TextAnchor.LowerLeft : TextAnchor.LowerRight;
         text.raycastTarget = false;
         text.color = Color.white;
         text.text = amount.ToString();
@@ -533,12 +652,37 @@ public sealed class Plugin : BaseUnityPlugin
         shadow.effectColor = Color.black;
         shadow.effectDistance = new Vector2(1.5f, -1.5f);
 
+        string pos = CounterPosition.Value;
+        float w = FontSize.Value * 1.8f;
+        float h = FontSize.Value * 1.5f;
+        Vector2 anchor, pivot, offset;
+
+        switch (pos)
+        {
+            case "BottomLeft":
+                anchor = new Vector2(0f, 0f); pivot = new Vector2(0f, 0f); offset = new Vector2(4f, 2f);
+                text.alignment = TextAnchor.LowerLeft;
+                break;
+            case "TopRight":
+                anchor = new Vector2(1f, 1f); pivot = new Vector2(1f, 1f); offset = new Vector2(-4f, -4f);
+                text.alignment = TextAnchor.UpperRight;
+                break;
+            case "TopLeft":
+                anchor = new Vector2(0f, 1f); pivot = new Vector2(0f, 1f); offset = new Vector2(4f, -4f);
+                text.alignment = TextAnchor.UpperLeft;
+                break;
+            default: // BottomRight
+                anchor = new Vector2(1f, 0f); pivot = new Vector2(1f, 0f); offset = new Vector2(-4f, 2f);
+                text.alignment = TextAnchor.LowerRight;
+                break;
+        }
+
         RectTransform rect = counter.GetComponent<RectTransform>();
-        rect.anchorMin = new Vector2(1f, 0f);
-        rect.anchorMax = new Vector2(1f, 0f);
-        rect.pivot = new Vector2(1f, 0f);
-        rect.sizeDelta = new Vector2(CounterWidth.Value, 30f);
-        rect.anchoredPosition = new Vector2(-4f + OffsetX.Value, 2f + OffsetY.Value);
+        rect.anchorMin = anchor;
+        rect.anchorMax = anchor;
+        rect.pivot = pivot;
+        rect.sizeDelta = new Vector2(w, h);
+        rect.anchoredPosition = offset;
     }
 
     [HarmonyPrefix]
@@ -718,6 +862,8 @@ public sealed class Plugin : BaseUnityPlugin
         VisualsResourcesHandler visuals = Managers.GetManager<VisualsResourcesHandler>();
         LogisticManager logisticManager = Managers.GetManager<LogisticManager>();
         WindowsGamepadHandler gamepadHandler = Managers.GetManager<WindowsGamepadHandler>();
+        int selectionIndex = (int)AccessTools.Field(typeof(InventoryDisplayer), "_selectionIndex").GetValue(__instance);
+        Inventory inventoryInteracting = (Inventory)AccessTools.Field(typeof(InventoryDisplayer), "_inventoryInteracting").GetValue(__instance);
 
         GameObjects.DestroyAllChildren(grid.gameObject, false);
         GameObject inventoryBlock = visuals.GetInventoryBlock();
@@ -785,6 +931,10 @@ public sealed class Plugin : BaseUnityPlugin
                 var selectable = slot.GetComponentInChildren<Selectable>();
                 if (selectable != null)
                     selectable.interactable = false;
+            }
+            else if (i == selectionIndex && (inventoryInteracting == null || inventoryInteracting == inventory))
+            {
+                gamepadHandler.SelectForController(slot, true, false, true, true, true, true);
             }
         }
 
